@@ -66,16 +66,20 @@
 ;;;   - chatbot exmples
 ;;;   
 
-(module xmpp scheme
+(module xmpp *
+
+(import chicken scheme)
+
+(use base64 posix extras tcp sxpath ssax srfi-18  srfi-13 srfi-69 openssl utf8 sxml-serializer)
+
+  ;; (require (planet lizorkin/sxml:2:1/sxml))   ;; encoding xml
+  ;; (require (planet lizorkin/ssax:2:0/ssax))   ;; decoding xml
+  ;; (require mzlib/os)                          ;; hostname
+  ;; (require scheme/tcp)                        ;; networking
+  ;; (require openssl)                           ;; ssl/tls
+  ;; (require srfi/13)                           ;; jid decoding
   
-  (require (planet lizorkin/sxml:2:1/sxml))   ;; encoding xml
-  (require (planet lizorkin/ssax:2:0/ssax))   ;; decoding xml
-  (require mzlib/os)                          ;; hostname
-  (require scheme/tcp)                        ;; networking
-  (require openssl)                           ;; ssl/tls
-  (require srfi/13)                           ;; jid decoding
-  
-  (provide (all-defined-out))
+;;  (provide (all-defined-out))
   
   ;;;; ;  ;;  ;
   ;; 
@@ -97,7 +101,7 @@
   ;;;;;; ;;  ;;  ;  ; ;   ;
   
   (define port 5222)
-  (define ssl-port 5223)
+  (define ssl-port 5222)
   
   (define (open-connection machine port handler)
     (let-values (((in out)
@@ -108,20 +112,26 @@
   
   (define (open-ssl-connection machine port handler)
     (let-values (((in out)
-                  (ssl-connect machine port 'tls)))
+                  (ssl-connect machine port (lambda (i o) (send (starttls))))))
       (handler in out)
       (close-output-port out)
       (close-input-port in)))
   
   (define (read-async in)
-    (bytes->string/utf-8 (list->bytes (read-async-bytes in))))
+    (list->string (reverse (map integer->char (read-async-bytes in)))))
   
+  ;; (define (read-async-bytes in)
+  ;;   (let ((bstr '()))
+  ;;     (when (sync/timeout 0 in)
+  ;;       (set! bstr (cons (read-byte in) (read-async-bytes in)))) bstr))
+
   (define (read-async-bytes in)
-    (let ((bstr '()))
-      (when (sync/timeout 0 in)
-        (set! bstr (cons (read-byte in) (read-async-bytes in)))) bstr))
-  
-  (define ssxml srl:sxml->xml-noindent) 
+    (let loop ((bstr '()))
+      (if (char-ready? in)
+          (loop (cons (read-byte in) bstr))
+          bstr)))
+
+  (define (ssxml doc) (serialize-sxml doc indent: #f)) 
   
   ;;;;;; ; ; ;      ;   ;; ;;;;;; ;
   ;;
@@ -130,34 +140,45 @@
   ;;;;;;;;;; ;;;  ;  ;;   ;  ;
   
   ;; intialization
-  (define (xmpp-stream host) 
-    (string-append "<?xml version='1.0'?>" ;; version='1.0' is a MUST for SASL on 5222 but NOT for ssl on 5223
-                   "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='" 
-                   host 
-                   "' xmlns='jabber:client' >")) 
-  
+  (define (xmpp-stream host #!optional restart?) 
+    (string-append 
+     (if restart? "" "<?xml version='1.0'?>") ;; version='1.0' is a MUST for SASL on 5222 but NOT for ssl on 5223
+     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='" 
+     host 
+     "' xmlns='jabber:client' >")) 
+
+  (define (xmpp-stream-restart host)
+    (xmpp-stream host #t))
+
+  (define (starttls)
+    "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")
+
   ;; authentication
-  (define (xmpp-auth username password resource)
-    (ssxml `(iq (@ (type "set") (id "auth")) 
-                (query (@ (xmlns "jabber:iq:auth")) 
-                       (username ,username) 
-                       (password ,password)
-                       (resource ,resource)))))
-  
+  ;; (define (xmpp-auth username password resource)
+  ;;   (ssxml `(iq (@ (type "set") (id "auth")) 
+  ;;               (query (@ (xmlns "jabber:iq:auth")) 
+  ;;                      (username ,username) 
+  ;;                      (password ,password)
+  ;;                      (resource ,resource)))))
+(define (xmpp-auth username password resource)
+  (ssxml `(auth (@ (xmlns "urn:ietf:params:xml:ns:xmpp-sasl")
+                   (mechanism "PLAIN"))
+                ,(base64-encode (sprintf "~a~a~a~a" #\nul username #\nul password)))))
+
   (define (xmpp-session host)
     (ssxml `(iq (@ (to ,host) (type "set") (id "session")) 
                 (session (@ (xmlns "urn:ietf:params:xml:ns:xmpp-session")))))) 
   
   ;; messages
   (define (message to body)
-    (ssxml `(message (@ (to ,to)) (body ,body))))
+    (ssxml `(message (@ (xmlns "jabber:client") (type "chat") (to ,to)) (body ,body))))
   
   ;; presence
-  (define (presence #:from (from "")
-                    #:to (to "") 
-                    #:type (type "") 
-                    #:show (show "") 
-                    #:status (status ""))
+  (define (presence #!key (from "")
+                    (to "") 
+                    (type "") 
+                    (show "") 
+                    (status ""))
     (cond ((not (string=? status ""))
            (ssxml `(presence (@ (type "probe")) (status ,status))))
           ((string=? type "") "<presence/>")
@@ -165,17 +186,33 @@
   
   ;; queries
   (define (iq body 
-              #:from (from "")
-              #:to (to "") 
-              #:type (type "") 
-              #:id (id ""))
+              #!key (from "")
+              (to "") 
+              (type "") 
+              (id ""))
     (ssxml `(iq (@ (to ,to) (type ,type) ,body))))
+
+  (define (xmpp-bind resource)
+    (if (string-null? resource)
+        (ssxml `(iq (@ (id "bindme") (type "set"))
+                    (bind
+                     (@ (xmlns "urn:ietf:params:xml:ns:xmpp-bind")))))
+        (ssxml `(iq (@ (id "bindme") (type "set"))
+                    (bind
+                     (@ (xmlns "urn:ietf:params:xml:ns:xmpp-bind"))
+                     (resource ,resource))))))
   
   ;; curried stanza disection (sxml stanza -> string)
-  (define ((sxpath-element xpath (ns "")) stanza) 
-    (let ((node ((sxpath xpath (list (cons 'ns ns))) stanza)))
-      (if (empty? node) "" (car node))))
+
+  ;; (define ((sxpath-element xpath (ns "")) stanza) 
+  ;;   (let ((node ((sxpath xpath (list (cons 'ns ns))) stanza)))
+  ;;     (if (empty? node) "" (car node))))
   
+  (define (sxpath-element xpath #!optional (ns ""))
+    (lambda (stanza)
+      (let ((node ((sxpath xpath (cons 'ns ns)) stanza)))
+        (if (null? node) "" (car node)))))
+
   ;; message 
   (define message-from (sxpath-element "message/@from/text()"))
   (define message-to (sxpath-element "message/@to/text()"))
@@ -261,16 +298,16 @@
   ;;
   ;;;;;; ;;  ; ; ;;  ;
   
-  (define xmpp-handlers (make-hash)) ;; a hash of tags and functions (possibly extend to using sxpaths and multiple handlers)
+  (define xmpp-handlers (make-hash-table)) ;; a hash of tags and functions (possibly extend to using sxpaths and multiple handlers)
   
   (define (set-xmpp-handler type fcn)
-    (dict-set! xmpp-handlers type fcn))
+    (hash-table-set! xmpp-handlers type fcn))
   
   (define (remove-xmpp-handler type fcn)
-    (dict-remove! xmpp-handlers type fcn))
+    (hash-table-delete! xmpp-handlers type fcn))
   
   (define (run-xmpp-handler type sz)
-    (let ((fcn (dict-ref xmpp-handlers type #f))) 
+    (let ((fcn (hash-table-ref/default xmpp-handlers type #f))) 
       (when fcn (begin
                   (debugf "attempting to run handler ~a.~%" fcn)
                   (fcn sz)))))
@@ -332,11 +369,13 @@
   
   ;; response handler
   (define (xmpp-response-handler in)
-    (thread (lambda () 
-              (let loop () 
-                (parse-xmpp-response (read-async in))
-                (sleep 0.1) ;; slight delay to avoid a tight loop
-                (loop)))))
+    (thread-start!
+     (make-thread (lambda () 
+                    (let loop () 
+                      (parse-xmpp-response (read-async in))
+                      (thread-sleep! 0.1) ;; slight delay to avoid a tight loop
+                      (loop)))
+                  'response-handler)))
   
   ;; jid splicing (assuming the jid is in the format user@host/resource)
   (define (jid-user jid)
@@ -349,11 +388,13 @@
   
   (define (jid-resource jid)
     (let ((r (jid-resource-0 jid)))
-      (if (void? r) (gethostname) r)))
+      (if (equal? "" r) (get-host-name) r)))
   
   (define (jid-resource-0 jid)
     (let ((v (string-index jid #\/)))
-      (when v (string-take-right jid (- (string-length jid) v 1)))))    
+      (if v
+          (string-take-right jid (- (string-length jid) v 1))
+          "")))    
   
   
   ;;;;  ;; ; ; ;; ;;   ;;;; ;
@@ -369,7 +410,10 @@
     (debugf "sending: ~a ~%~%" str)
     (let* ((p-out  (xmpp-out-port))
            (out (if p-out p-out xmpp-out-port-v))) 
-      (fprintf out "~A~%" str) (flush-output out)))
+      (fprintf out "~A" str) (flush-output out)))
+
+(define (recieve)
+  (ssax:xml->sxml (xmpp-in-port) '()))
   
   (define-syntax with-xmpp-session
     (syntax-rules ()
@@ -378,18 +422,21 @@
              (user (jid-user jid))
              (resource (jid-resource jid)))
          (let-values (((in out)
-                       (ssl-connect host ssl-port 'tls)))
-           ;;(tcp-connect host port)))
+                      (ssl-connect host ssl-port 'tls (lambda (i o)  (display (xmpp-stream host) o)(display (starttls) o)(print (read-string 361 i))))
+                       ))
+
            (parameterize ((xmpp-in-port in)
                           (xmpp-out-port out))
-             (file-stream-buffer-mode out 'line)
              (xmpp-response-handler in) 
              (send (xmpp-stream host))
-             (send (xmpp-session host))           
-             ;(starttls in out)
              (send (xmpp-auth user pass resource))
+             (send (xmpp-stream-restart host))
+             (send (xmpp-bind ""))
              (send (presence))
+;             (send (xmpp-session host))           
+;             (print (read-string 1727 in))
              (begin form . forms)
+             (send "</stream:stream>")
              (close-output-port out)
              (close-input-port in)))))))
   
@@ -406,7 +453,7 @@
         ;;(tcp-connect host port)))
         (set! xmpp-in-port-v in)
         (set! xmpp-out-port-v out)
-        (file-stream-buffer-mode out 'line)
+;        (file-stream-buffer-mode out 'line)
         (xmpp-response-handler in) 
         (send (xmpp-stream host))
         (send (xmpp-session host))           
